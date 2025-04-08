@@ -8,8 +8,9 @@ import http.client
 
 from mcp.server.fastmcp import FastMCP
 
+# Edit by Foo1
 # The log_level is necessary for Cline to work: https://github.com/jlowin/fastmcp/issues/81
-mcp = FastMCP("github.com/mrexodia/ida-pro-mcp", log_level="ERROR")
+mcp = FastMCP("github.com/qw3rtyou/ida-pro-mcp", log_level="ERROR")
 
 jsonrpc_request_id = 1
 

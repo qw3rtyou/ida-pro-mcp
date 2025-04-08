@@ -70,6 +70,13 @@ class RPCRegistry:
 
 rpc_registry = RPCRegistry()
 
+# Add by Foo1
+class MemoryDump(TypedDict):
+    address: str
+    size: int
+    hex: str
+    ascii: str
+
 def jsonrpc(func: Callable) -> Callable:
     """Decorator to register a function as a JSON-RPC method"""
     global rpc_registry
@@ -994,6 +1001,37 @@ def set_local_variable_type(
     if not ida_hexrays.modify_user_lvars(func.start_ea, modifier):
         raise IDAError(f"Failed to modify local variable: {variable_name}")
     refresh_decompiler_ctext(func.start_ea)
+
+# Add by Foo1
+@jsonrpc
+@idaread
+def read_memory(
+    address: Annotated[str, "덤프를 시작할 메모리 주소"],
+    size: Annotated[int, "읽어올 바이트 수"]
+) -> MemoryDump:
+    """특정 주소에서 지정된 크기만큼 메모리 내용을 읽어옵니다."""
+    parsed_address = parse_address(address)
+
+    if size <= 0:
+        raise IDAError("읽어올 크기(size)는 0보다 커야 합니다.")
+
+    # ida_bytes.get_bytes 함수를 사용하여 메모리 읽기
+    bytes_data = ida_bytes.get_bytes(parsed_address, size)
+
+    if bytes_data is None:
+        # 읽기 실패 시 (예: 유효하지 않은 주소)
+        raise IDAError(f"{hex(parsed_address)} 주소에서 {size} 바이트를 읽는 데 실패했습니다.")
+
+    # 읽은 바이트를 ASCII로 변환 (출력 불가능한 문자는 '.'으로 대체)
+    ascii_repr = "".join(chr(b) if 32 <= b <= 126 else '.' for b in bytes_data)
+
+    return {
+        "address": hex(parsed_address),
+        "size": len(bytes_data), # 실제 읽은 크기 반환
+        "hex": bytes_data.hex(" "), # 16진수 문자열로 변환 (공백 구분)
+        "ascii": ascii_repr
+    }
+
 
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
