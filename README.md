@@ -31,6 +31,8 @@ Available functionality:
 - `declare_c_type(c_declaration)`: Create or update a local type from a C declaration.
 - `set_local_variable_type(function_address, variable_name, new_type)`: Set a local variable's type.
 
+- `read_memory(address, size)`: Get memory Dump
+
 ## Prerequisites
 
 - [Python](https://www.python.org/downloads/) (**3.11 or higher**) 
@@ -46,7 +48,8 @@ Available functionality:
 Install (or upgrade) the IDA Pro MCP package:
 
 ```sh
-pip install --upgrade git+https://github.com/mrexodia/ida-pro-mcp
+# pip install --upgrade git+https://github.com/mrexodia/ida-pro-mcp
+pip install --upgrade git+https://github.com/qw3rtyou/ida-pro-mcp
 ```
 
 Configure the MCP servers and install the IDA Plugin:
