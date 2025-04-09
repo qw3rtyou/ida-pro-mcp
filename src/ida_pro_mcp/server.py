@@ -150,8 +150,8 @@ GENERATED_PY = os.path.join(SCRIPT_DIR, "server_generated.py")
 # NOTE: This is in the global scope on purpose
 if not os.path.exists(IDA_PLUGIN_PY):
     raise RuntimeError(f"IDA plugin not found at {IDA_PLUGIN_PY} (did you move it?)")
-# Edit by Foo1 because of the encoding error
-with open(IDA_PLUGIN_PY, "r",encoding='UTF-8') as f:
+
+with open(IDA_PLUGIN_PY, "r") as f:
     code = f.read()
 module = ast.parse(code, IDA_PLUGIN_PY)
 visitor = MCPVisitor()

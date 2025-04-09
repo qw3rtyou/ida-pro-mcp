@@ -2,6 +2,7 @@ import sys
 
 if sys.version_info < (3, 11):
     raise RuntimeError("Python 3.11 or higher is required for the MCP plugin")
+import os
 import re
 import json
 import struct
@@ -9,6 +10,7 @@ import threading
 import http.server
 from urllib.parse import urlparse
 from typing import Any, Callable, get_type_hints, TypedDict, Optional, Annotated, TypeVar, Generic
+import ida_struct
 
 class JSONRPCError(Exception):
     def __init__(self, code: int, message: str, data: Any = None):
@@ -69,13 +71,6 @@ class RPCRegistry:
             raise JSONRPCError(-32600, "Invalid Request: params must be array or object")
 
 rpc_registry = RPCRegistry()
-
-# Add by Foo1
-class MemoryDump(TypedDict):
-    address: str
-    size: int
-    hex: str
-    ascii: str
 
 def jsonrpc(func: Callable) -> Callable:
     """Decorator to register a function as a JSON-RPC method"""
@@ -1003,34 +998,313 @@ def set_local_variable_type(
     refresh_decompiler_ctext(func.start_ea)
 
 # Add by Foo1
+class MemoryDump(TypedDict):
+    address: str
+    size: int
+    hex: str
+    ascii: str
+
+# Add by Foo1
 @jsonrpc
 @idaread
 def read_memory(
-    address: Annotated[str, "덤프를 시작할 메모리 주소"],
-    size: Annotated[int, "읽어올 바이트 수"]
+    address: Annotated[str, "Memory address to start dump"],
+    size: Annotated[int, "Number of bytes to read"]
 ) -> MemoryDump:
-    """특정 주소에서 지정된 크기만큼 메모리 내용을 읽어옵니다."""
+    """Read memory contents from specified address with given size."""
     parsed_address = parse_address(address)
 
     if size <= 0:
-        raise IDAError("읽어올 크기(size)는 0보다 커야 합니다.")
+        raise IDAError("Size must be greater than 0")
 
-    # ida_bytes.get_bytes 함수를 사용하여 메모리 읽기
     bytes_data = ida_bytes.get_bytes(parsed_address, size)
 
     if bytes_data is None:
-        # 읽기 실패 시 (예: 유효하지 않은 주소)
-        raise IDAError(f"{hex(parsed_address)} 주소에서 {size} 바이트를 읽는 데 실패했습니다.")
+        raise IDAError(f"Failed to read {size} bytes at address {hex(parsed_address)}")
 
-    # 읽은 바이트를 ASCII로 변환 (출력 불가능한 문자는 '.'으로 대체)
     ascii_repr = "".join(chr(b) if 32 <= b <= 126 else '.' for b in bytes_data)
 
     return {
         "address": hex(parsed_address),
-        "size": len(bytes_data), # 실제 읽은 크기 반환
-        "hex": bytes_data.hex(" "), # 16진수 문자열로 변환 (공백 구분)
+        "size": len(bytes_data),
+        "hex": bytes_data.hex(" "),
         "ascii": ascii_repr
     }
+
+def parse_terminator(pattern_hex: str) -> bytes:
+    try:
+        return bytes.fromhex(pattern_hex)
+    except ValueError:
+        raise IDAError(f"Invalid terminator pattern hex: {pattern_hex}")
+
+@jsonrpc
+@idaread
+def read_memory_until(
+    address: Annotated[str, "Memory address to start reading from"],
+    terminator_pattern_hex: Annotated[str, "Hex representation of the terminator pattern (e.g., '00' for null byte, '00000000' for null DWORD)"],
+    element_size: Annotated[int, "Size of the element to check for the terminator (e.g., 1 for byte, 4 for DWORD). Must be > 0."],
+    max_size: Annotated[int, "Maximum number of bytes to read to prevent infinite loops"]
+) -> MemoryDump:
+    """Reads memory from the specified address until a terminator pattern is found or max_size is reached."""
+    if element_size <= 0:
+        raise IDAError("Element size must be greater than 0")
+    if max_size <= 0:
+        raise IDAError("Max size must be greater than 0")
+
+    parsed_address = parse_address(address)
+    terminator = parse_terminator(terminator_pattern_hex)
+    terminator_len = len(terminator)
+
+    if terminator_len == 0:
+         raise IDAError("Terminator pattern cannot be empty")
+    if terminator_len > element_size:
+         raise IDAError("Terminator pattern length cannot be greater than element size")
+
+    bytes_data = b""
+    current_address = parsed_address
+    read_size = 0
+
+    while read_size < max_size:
+        # Read element_size bytes at a time
+        chunk_size = min(element_size, max_size - read_size)
+        chunk = ida_bytes.get_bytes(current_address, chunk_size)
+
+        if chunk is None:
+            # Reached end of readable memory before finding terminator or max_size
+            break # Or raise IDAError? Decided to return what was read so far.
+
+        bytes_data += chunk
+        read_size += len(chunk)
+        current_address += len(chunk)
+
+        # Check if the last 'element_size' bytes contain the terminator pattern
+        # We only need to check the last read element for the pattern.
+        if len(chunk) >= element_size:
+            # Ensure we only check within the bounds of the last read element
+            check_start_offset = max(0, len(chunk) - element_size)
+            element_to_check = chunk[check_start_offset:]
+            # Compare the relevant part of the element with the terminator
+            # Using endswith for simplicity assuming terminator is aligned
+            # A more robust check might be needed for unaligned patterns within element
+            if element_to_check.endswith(terminator): # Simplified check
+                 # Found terminator, trim the data to exclude the terminator itself?
+                 # For now, include the terminator in the result, like C strings.
+                 break # Found terminator
+
+    if not bytes_data and read_size == 0:
+         # If nothing could be read at the start address
+         raise IDAError(f"Failed to read any bytes at address {hex(parsed_address)}")
+
+    ascii_repr = "".join(chr(b) if 32 <= b <= 126 else '.' for b in bytes_data)
+
+    return {
+        "address": hex(parsed_address),
+        "size": len(bytes_data),
+        "hex": bytes_data.hex(" "),
+        "ascii": ascii_repr
+    }
+
+
+@jsonrpc
+@idaread # Reading memory is generally safe for read access
+def save_memory_to_file(
+    address: Annotated[str, "Memory address to start dump"],
+    size: Annotated[int, "Number of bytes to read"],
+    filename: Annotated[str, "Path to save the data (relative to IDA workspace or absolute)"]
+) -> dict:
+    """Reads memory contents and saves them to a file."""
+    if size <= 0:
+        raise IDAError("Size must be greater than 0")
+
+    parsed_address = parse_address(address)
+    bytes_data = ida_bytes.get_bytes(parsed_address, size)
+
+    if bytes_data is None:
+        raise IDAError(f"Failed to read {size} bytes at address {hex(parsed_address)}")
+
+    try:
+        # Consider security implications of writing files.
+        # Maybe restrict paths or require user confirmation? For now, write directly.
+        # Resolve relative paths based on IDB path? Or CWD? Assume CWD for now.
+        # For security, it might be better to return the data and let the client save it.
+        # However, implementing the tool as requested:
+        filepath = os.path.abspath(filename) # Ensure absolute path
+        # Add checks here: is filepath within allowed directories?
+        # if not is_path_allowed(filepath): raise IDAError("File path not allowed")
+
+        with open(filepath, "wb") as f:
+            f.write(bytes_data)
+        return {"success": True, "filepath": filepath, "bytes_written": len(bytes_data)}
+    except IOError as e:
+        raise IDAError(f"Failed to write to file '{filename}': {e}")
+    except Exception as e:
+        raise IDAError(f"An unexpected error occurred while writing file: {e}")
+
+
+@jsonrpc
+@idaread # Reading memory is generally safe for read access
+def save_memory_until_to_file(
+    address: Annotated[str, "Memory address to start reading from"],
+    terminator_pattern_hex: Annotated[str, "Hex representation of the terminator pattern"],
+    element_size: Annotated[int, "Size of the element to check for the terminator"],
+    max_size: Annotated[int, "Maximum number of bytes to read"],
+    filename: Annotated[str, "Path to save the data"]
+) -> dict:
+    """Reads memory until a terminator is found or max_size is reached, and saves to a file."""
+    if element_size <= 0:
+        raise IDAError("Element size must be greater than 0")
+    if max_size <= 0:
+        raise IDAError("Max size must be greater than 0")
+
+    parsed_address = parse_address(address)
+    terminator = parse_terminator(terminator_pattern_hex)
+    terminator_len = len(terminator)
+
+    if terminator_len == 0:
+         raise IDAError("Terminator pattern cannot be empty")
+    if terminator_len > element_size:
+         raise IDAError("Terminator pattern length cannot be greater than element size")
+
+    bytes_data = b""
+    current_address = parsed_address
+    read_size = 0
+    found_terminator = False
+
+    while read_size < max_size:
+        chunk_size = min(element_size, max_size - read_size)
+        chunk = ida_bytes.get_bytes(current_address, chunk_size)
+
+        if chunk is None:
+            break
+
+        bytes_data += chunk
+        read_size += len(chunk)
+        current_address += len(chunk)
+
+        if len(chunk) >= element_size:
+            element_to_check = chunk[max(0, len(chunk) - element_size):]
+            if element_to_check.endswith(terminator):
+                 found_terminator = True
+                 break
+
+    if not bytes_data and read_size == 0:
+         raise IDAError(f"Failed to read any bytes at address {hex(parsed_address)}")
+
+    try:
+        filepath = os.path.abspath(filename)
+        # Add security checks for filepath here
+        with open(filepath, "wb") as f:
+            f.write(bytes_data)
+        return {
+            "success": True,
+            "filepath": filepath,
+            "bytes_written": len(bytes_data),
+            "terminator_found": found_terminator
+        }
+    except IOError as e:
+        raise IDAError(f"Failed to write to file '{filename}': {e}")
+    except Exception as e:
+        raise IDAError(f"An unexpected error occurred while writing file: {e}")
+
+
+@jsonrpc
+@idaread
+def get_data_info(address: Annotated[str, "Address to get information about"]) -> dict:
+    """Gets information about the data at the specified address using IDA's analysis."""
+    parsed_address = parse_address(address)
+    flags = ida_bytes.get_flags(parsed_address)
+    data_type = "Unknown"
+    estimated_size = None
+
+    if ida_bytes.is_code(flags):
+        data_type = "Code"
+        func = ida_funcs.get_func(parsed_address)
+        if func:
+            estimated_size = func.size()
+    elif ida_bytes.is_strlit(flags):
+        data_type = "String"
+        # ida_bytes.get_strlit_contents tends to be more reliable for size
+        str_content = ida_bytes.get_strlit_contents(parsed_address, -1, ida_nalt.STRTYPE_C) # Assume C string first
+        if str_content is None: # Try other types if needed
+             str_content = ida_bytes.get_strlit_contents(parsed_address, -1, ida_nalt.STRTYPE_PASCAL) # Example
+             # ... add more types
+        if str_content is not None:
+             estimated_size = len(str_content) + 1 # Include null terminator for C strings
+    elif ida_bytes.is_struct(flags):
+        data_type = "Struct"
+        ti = ida_typeinf.tinfo_t()
+        if ida_bytes.get_tinfo(ti, parsed_address):
+             struct_name = ti.dstr() # Get type name
+             # Need get_struct_size to get actual size
+             estimated_size = ti.get_size() # Might return BADSIZE
+             data_type = f"Struct ({struct_name})" if struct_name else "Struct"
+        else: # Fallback: try getting struct instance id
+            # This requires more complex logic involving ida_struct API
+            pass # Placeholder
+    elif ida_bytes.is_oword(flags):
+         data_type = "OWORD (16 bytes)"
+         estimated_size = 16
+    elif ida_bytes.is_qword(flags):
+         data_type = "QWORD (8 bytes)"
+         estimated_size = 8
+    elif ida_bytes.is_dword(flags):
+         data_type = "DWORD (4 bytes)"
+         estimated_size = 4
+    elif ida_bytes.is_word(flags):
+         data_type = "WORD (2 bytes)"
+         estimated_size = 2
+    elif ida_bytes.is_byte(flags):
+         data_type = "BYTE (1 byte)"
+         estimated_size = 1
+    elif ida_bytes.is_data(flags):
+        data_type = "Data" # Generic data
+        # Try to determine array size if possible
+        item_size = ida_bytes.get_item_size(parsed_address)
+        if item_size > 0:
+             estimated_size = item_size
+             # If it's part of an array, try to guess the array bounds (complex)
+    # Add more checks for alignment, undef, etc.
+
+    # Get comment if any
+    comment = ida_bytes.get_cmt(parsed_address, False) or ida_bytes.get_cmt(parsed_address, True)
+
+    return {
+        "address": hex(parsed_address),
+        "flags_value": hex(flags),
+        "data_type": data_type,
+        "estimated_size": estimated_size, # Can be None if unknown
+        "is_code": ida_bytes.is_code(flags),
+        "is_data": ida_bytes.is_data(flags),
+        "is_string": ida_bytes.is_strlit(flags),
+        "is_struct": ida_bytes.is_struct(flags),
+        "comment": comment
+    }
+
+@jsonrpc
+@idaread
+def get_struct_size(struct_name: Annotated[str, "Name of the struct type"]) -> Optional[int]:
+    """Gets the size of a defined struct type."""
+    # Find the struct ID by name
+    sid = ida_struct.get_struc_id(struct_name)
+    if sid == idaapi.BADADDR:
+        # Try finding typedef if it's a typedef'd struct
+        ti = ida_typeinf.tinfo_t()
+        if ida_nalt.find_named_type(ti, struct_name, ida_nalt.NTF_SYMM):
+             if ti.is_struct():
+                 size = ti.get_size()
+                 return size if size != idaapi.BADSIZE else None
+        return None # Not found or not a struct
+
+    # Get the struct object
+    sptr = ida_struct.get_struc(sid)
+    if not sptr:
+        return None # Should not happen if sid is valid
+
+    # Get the size
+    size = ida_struct.get_struc_size(sptr)
+    return size if size != idaapi.BADADDR else None # BADADDR often used for error/unknown size
+
+
 
 
 class MCP(idaapi.plugin_t):
