@@ -243,6 +243,7 @@ def install_mcp_servers(*, uninstall=False, quiet=False, env={}):
             "Cline": (os.path.join(os.getenv("APPDATA"), "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings"), "cline_mcp_settings.json"),
             "Roo Code": (os.path.join(os.getenv("APPDATA"), "Code", "User", "globalStorage", "rooveterinaryinc.roo-cline", "settings"), "mcp_settings.json"),
             "Claude": (os.path.join(os.getenv("APPDATA"), "Claude"), "claude_desktop_config.json"),
+            # "Cursor": (os.path.join(os.getenv("USERPROFILE"), ".cursor"), "mcp.json"),
         }
     elif sys.platform == "darwin":
         configs = {
