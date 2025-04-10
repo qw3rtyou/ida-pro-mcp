@@ -10,7 +10,7 @@ import threading
 import http.server
 from urllib.parse import urlparse
 from typing import Any, Callable, get_type_hints, TypedDict, Optional, Annotated, TypeVar, Generic
-import ida_struct
+
 
 class JSONRPCError(Exception):
     def __init__(self, code: int, message: str, data: Any = None):
@@ -997,14 +997,29 @@ def set_local_variable_type(
         raise IDAError(f"Failed to modify local variable: {variable_name}")
     refresh_decompiler_ctext(func.start_ea)
 
-# Add by Foo1
+# Add by Foo1 from here
+import ida_hexrays
+import ida_kernwin
+import ida_funcs
+import ida_gdl
+import ida_lines
+import ida_idaapi
+import idc
+import idaapi
+import idautils
+import ida_nalt # Needed for type lookups
+import ida_bytes
+import ida_typeinf # Needed for type info and size
+import ida_xref
+import ida_entry
+
+
 class MemoryDump(TypedDict):
     address: str
     size: int
     hex: str
     ascii: str
 
-# Add by Foo1
 @jsonrpc
 @idaread
 def read_memory(
@@ -1030,7 +1045,9 @@ def read_memory(
         "hex": bytes_data.hex(" "),
         "ascii": ascii_repr
     }
+# Add by Foo1 - New MCP tools
 
+# Helper function to parse terminator pattern
 def parse_terminator(pattern_hex: str) -> bytes:
     try:
         return bytes.fromhex(pattern_hex)
@@ -1057,39 +1074,36 @@ def read_memory_until(
 
     if terminator_len == 0:
          raise IDAError("Terminator pattern cannot be empty")
-    if terminator_len > element_size:
-         raise IDAError("Terminator pattern length cannot be greater than element size")
+    # Allow terminator smaller than element size (e.g. finding \x00 in a DWORD)
+    # if terminator_len > element_size:
+    #      raise IDAError("Terminator pattern length cannot be greater than element size") # This check might be too strict
 
     bytes_data = b""
     current_address = parsed_address
     read_size = 0
 
     while read_size < max_size:
-        # Read element_size bytes at a time
+        # Read element_size bytes at a time, or remaining size if less
         chunk_size = min(element_size, max_size - read_size)
         chunk = ida_bytes.get_bytes(current_address, chunk_size)
 
         if chunk is None:
             # Reached end of readable memory before finding terminator or max_size
-            break # Or raise IDAError? Decided to return what was read so far.
+            break
 
         bytes_data += chunk
         read_size += len(chunk)
         current_address += len(chunk)
 
-        # Check if the last 'element_size' bytes contain the terminator pattern
-        # We only need to check the last read element for the pattern.
-        if len(chunk) >= element_size:
-            # Ensure we only check within the bounds of the last read element
-            check_start_offset = max(0, len(chunk) - element_size)
-            element_to_check = chunk[check_start_offset:]
-            # Compare the relevant part of the element with the terminator
-            # Using endswith for simplicity assuming terminator is aligned
-            # A more robust check might be needed for unaligned patterns within element
-            if element_to_check.endswith(terminator): # Simplified check
-                 # Found terminator, trim the data to exclude the terminator itself?
-                 # For now, include the terminator in the result, like C strings.
-                 break # Found terminator
+        # Check if the last 'element_size' (or fewer, if end of read) bytes contain the terminator
+        # Check within the entire 'bytes_data' read so far, focusing on the end
+        check_start_idx = max(0, len(bytes_data) - element_size - terminator_len + 1) # Heuristic start index for check
+        if bytes_data[check_start_idx:].find(terminator) != -1:
+            # Found terminator - stop reading. Include terminator in result.
+            # To be precise, find the *first* occurrence of terminator within the check window
+            # and potentially trim 'bytes_data' to that point + terminator length
+            # For simplicity now, just break after finding it somewhere near the end.
+            break # Found terminator
 
     if not bytes_data and read_size == 0:
          # If nothing could be read at the start address
@@ -1123,13 +1137,10 @@ def save_memory_to_file(
         raise IDAError(f"Failed to read {size} bytes at address {hex(parsed_address)}")
 
     try:
-        # Consider security implications of writing files.
-        # Maybe restrict paths or require user confirmation? For now, write directly.
-        # Resolve relative paths based on IDB path? Or CWD? Assume CWD for now.
-        # For security, it might be better to return the data and let the client save it.
-        # However, implementing the tool as requested:
-        filepath = os.path.abspath(filename) # Ensure absolute path
-        # Add checks here: is filepath within allowed directories?
+        # Security Note: Writing arbitrary files is a risk.
+        # Implement path validation/restriction based on allowed directories.
+        filepath = os.path.abspath(filename)
+        # Add security checks for filepath here, e.g.:
         # if not is_path_allowed(filepath): raise IDAError("File path not allowed")
 
         with open(filepath, "wb") as f:
@@ -1138,74 +1149,9 @@ def save_memory_to_file(
     except IOError as e:
         raise IDAError(f"Failed to write to file '{filename}': {e}")
     except Exception as e:
+        # Log the full exception for debugging
+        traceback.print_exc()
         raise IDAError(f"An unexpected error occurred while writing file: {e}")
-
-
-@jsonrpc
-@idaread # Reading memory is generally safe for read access
-def save_memory_until_to_file(
-    address: Annotated[str, "Memory address to start reading from"],
-    terminator_pattern_hex: Annotated[str, "Hex representation of the terminator pattern"],
-    element_size: Annotated[int, "Size of the element to check for the terminator"],
-    max_size: Annotated[int, "Maximum number of bytes to read"],
-    filename: Annotated[str, "Path to save the data"]
-) -> dict:
-    """Reads memory until a terminator is found or max_size is reached, and saves to a file."""
-    if element_size <= 0:
-        raise IDAError("Element size must be greater than 0")
-    if max_size <= 0:
-        raise IDAError("Max size must be greater than 0")
-
-    parsed_address = parse_address(address)
-    terminator = parse_terminator(terminator_pattern_hex)
-    terminator_len = len(terminator)
-
-    if terminator_len == 0:
-         raise IDAError("Terminator pattern cannot be empty")
-    if terminator_len > element_size:
-         raise IDAError("Terminator pattern length cannot be greater than element size")
-
-    bytes_data = b""
-    current_address = parsed_address
-    read_size = 0
-    found_terminator = False
-
-    while read_size < max_size:
-        chunk_size = min(element_size, max_size - read_size)
-        chunk = ida_bytes.get_bytes(current_address, chunk_size)
-
-        if chunk is None:
-            break
-
-        bytes_data += chunk
-        read_size += len(chunk)
-        current_address += len(chunk)
-
-        if len(chunk) >= element_size:
-            element_to_check = chunk[max(0, len(chunk) - element_size):]
-            if element_to_check.endswith(terminator):
-                 found_terminator = True
-                 break
-
-    if not bytes_data and read_size == 0:
-         raise IDAError(f"Failed to read any bytes at address {hex(parsed_address)}")
-
-    try:
-        filepath = os.path.abspath(filename)
-        # Add security checks for filepath here
-        with open(filepath, "wb") as f:
-            f.write(bytes_data)
-        return {
-            "success": True,
-            "filepath": filepath,
-            "bytes_written": len(bytes_data),
-            "terminator_found": found_terminator
-        }
-    except IOError as e:
-        raise IDAError(f"Failed to write to file '{filename}': {e}")
-    except Exception as e:
-        raise IDAError(f"An unexpected error occurred while writing file: {e}")
-
 
 @jsonrpc
 @idaread
@@ -1216,54 +1162,74 @@ def get_data_info(address: Annotated[str, "Address to get information about"]) -
     data_type = "Unknown"
     estimated_size = None
 
-    if ida_bytes.is_code(flags):
-        data_type = "Code"
-        func = ida_funcs.get_func(parsed_address)
-        if func:
-            estimated_size = func.size()
-    elif ida_bytes.is_strlit(flags):
-        data_type = "String"
-        # ida_bytes.get_strlit_contents tends to be more reliable for size
-        str_content = ida_bytes.get_strlit_contents(parsed_address, -1, ida_nalt.STRTYPE_C) # Assume C string first
-        if str_content is None: # Try other types if needed
-             str_content = ida_bytes.get_strlit_contents(parsed_address, -1, ida_nalt.STRTYPE_PASCAL) # Example
-             # ... add more types
-        if str_content is not None:
-             estimated_size = len(str_content) + 1 # Include null terminator for C strings
-    elif ida_bytes.is_struct(flags):
-        data_type = "Struct"
-        ti = ida_typeinf.tinfo_t()
-        if ida_bytes.get_tinfo(ti, parsed_address):
-             struct_name = ti.dstr() # Get type name
-             # Need get_struct_size to get actual size
-             estimated_size = ti.get_size() # Might return BADSIZE
-             data_type = f"Struct ({struct_name})" if struct_name else "Struct"
-        else: # Fallback: try getting struct instance id
-            # This requires more complex logic involving ida_struct API
-            pass # Placeholder
-    elif ida_bytes.is_oword(flags):
-         data_type = "OWORD (16 bytes)"
-         estimated_size = 16
-    elif ida_bytes.is_qword(flags):
-         data_type = "QWORD (8 bytes)"
-         estimated_size = 8
-    elif ida_bytes.is_dword(flags):
-         data_type = "DWORD (4 bytes)"
-         estimated_size = 4
-    elif ida_bytes.is_word(flags):
-         data_type = "WORD (2 bytes)"
-         estimated_size = 2
-    elif ida_bytes.is_byte(flags):
-         data_type = "BYTE (1 byte)"
-         estimated_size = 1
-    elif ida_bytes.is_data(flags):
-        data_type = "Data" # Generic data
-        # Try to determine array size if possible
-        item_size = ida_bytes.get_item_size(parsed_address)
-        if item_size > 0:
-             estimated_size = item_size
-             # If it's part of an array, try to guess the array bounds (complex)
-    # Add more checks for alignment, undef, etc.
+    # 1. Check for specific type information first (most reliable)
+    ti = ida_typeinf.tinfo_t()
+    # Use ida_nalt.get_tinfo (Corrected module)
+    if ida_nalt.get_tinfo(ti, parsed_address): # Check return value
+        # Type info exists, proceed with analysis
+        type_name = ti.dstr() # Get the specific type name (e.g., struct MyStruct, int[10])
+        size = ti.get_size()
+        estimated_size = size if size != idaapi.BADSIZE else None
+
+        if ti.is_struct() or ti.is_union():
+            data_type = type_name if type_name else ("Struct" if ti.is_struct() else "Union")
+        elif ti.is_array():
+            data_type = f"Array ({type_name})" if type_name else "Array"
+        elif ti.is_ptr():
+             data_type = f"Pointer ({type_name})" if type_name else "Pointer"
+             # Size of a pointer depends on architecture, use tinfo_t size
+        elif ti.is_enum():
+             data_type = f"Enum ({type_name})" if type_name else "Enum"
+        elif ti.is_func():
+             data_type = f"Function Type ({type_name})" if type_name else "Function Type"
+        elif ti.is_udt(): # User-defined type (covers struct/union/enum implicitly?)
+             data_type = f"UDT ({type_name})" if type_name else "UDT"
+        elif ti.is_int() or ti.is_float(): # Basic types
+             data_type = type_name if type_name else ("Integer" if ti.is_int() else "Float")
+        # Add more specific checks if needed
+        else:
+             data_type = f"Typed Data ({type_name})" if type_name else "Typed Data"
+
+    # 2. If no type info, check flags for common patterns
+    # Use elif here to ensure it only runs if get_tinfo failed or didn't identify the type
+    elif data_type == "Unknown": # Only check flags if type info didn't yield a result
+        if ida_bytes.is_code(flags):
+            data_type = "Code"
+            func = ida_funcs.get_func(parsed_address)
+            if func:
+                estimated_size = func.size()
+        elif ida_bytes.is_strlit(flags):
+            data_type = "String"
+            # Use ida_bytes.get_strlit_contents for better size estimate
+            str_content_info = ida_bytes.get_strlit_contents(parsed_address, -1, -1, ida_bytes.STRCONV_GUESS) # Guess encoding
+            if str_content_info is not None:
+                # str_content_info is tuple (content_bytes, strtype)
+                estimated_size = len(str_content_info[0])
+                # Add 1 for null terminator for C-like strings
+                if str_content_info[1] in [ida_nalt.STRTYPE_C, ida_nalt.STRTYPE_C_16, ida_nalt.STRTYPE_C_32]:
+                    estimated_size += (str_content_info[1] & 0x0F) + 1 # Size of null terminator
+            else: # Fallback size estimate
+                 estimated_size = ida_bytes.get_item_size(parsed_address)
+        elif ida_bytes.is_oword(flags):
+            data_type = "OWORD (16 bytes)"
+            estimated_size = 16
+        elif ida_bytes.is_qword(flags):
+            data_type = "QWORD (8 bytes)"
+            estimated_size = 8
+        elif ida_bytes.is_dword(flags):
+            data_type = "DWORD (4 bytes)"
+            estimated_size = 4
+        elif ida_bytes.is_word(flags):
+            data_type = "WORD (2 bytes)"
+            estimated_size = 2
+        elif ida_bytes.is_byte(flags):
+            data_type = "BYTE (1 byte)"
+            estimated_size = 1
+        elif ida_bytes.is_data(flags):
+            data_type = "Data" # Generic data
+            item_size = ida_bytes.get_item_size(parsed_address)
+            if item_size > 0:
+                estimated_size = item_size
 
     # Get comment if any
     comment = ida_bytes.get_cmt(parsed_address, False) or ida_bytes.get_cmt(parsed_address, True)
@@ -1276,36 +1242,31 @@ def get_data_info(address: Annotated[str, "Address to get information about"]) -
         "is_code": ida_bytes.is_code(flags),
         "is_data": ida_bytes.is_data(flags),
         "is_string": ida_bytes.is_strlit(flags),
-        "is_struct": ida_bytes.is_struct(flags),
+        # More specific check based on data_type derived from tinfo or flags
+        "is_struct_or_union": data_type.startswith("Struct") or data_type.startswith("Union") or "UDT" in data_type,
         "comment": comment
     }
 
 @jsonrpc
 @idaread
-def get_struct_size(struct_name: Annotated[str, "Name of the struct type"]) -> Optional[int]:
-    """Gets the size of a defined struct type."""
-    # Find the struct ID by name
-    sid = ida_struct.get_struc_id(struct_name)
-    if sid == idaapi.BADADDR:
-        # Try finding typedef if it's a typedef'd struct
-        ti = ida_typeinf.tinfo_t()
-        if ida_nalt.find_named_type(ti, struct_name, ida_nalt.NTF_SYMM):
-             if ti.is_struct():
-                 size = ti.get_size()
-                 return size if size != idaapi.BADSIZE else None
-        return None # Not found or not a struct
+def get_struct_size(struct_or_union_name: Annotated[str, "Name of the struct or union type"]) -> Optional[int]:
+    """Gets the size of a defined struct or union type using IDA 9.0 idc functions."""
+    # Get structure ID by name using the idc alternative provided in 8.4 -> 9.0 notes
+    struct_id = idc.get_struc_id(struct_or_union_name) # <--- CORRECTED API
 
-    # Get the struct object
-    sptr = ida_struct.get_struc(sid)
-    if not sptr:
-        return None # Should not happen if sid is valid
+    if struct_id == idaapi.BADADDR or struct_id == -1: # Check against BADADDR and common invalid ID -1
+        # Structure not found by that name
+        return None
 
-    # Get the size
-    size = ida_struct.get_struc_size(sptr)
-    return size if size != idaapi.BADADDR else None # BADADDR often used for error/unknown size
+    # Get structure size using the idc alternative provided in 8.4 -> 9.0 notes
+    size = idc.get_struc_size(struct_id) # <--- CORRECTED API
 
-
-
+    # idc.get_struc_size returns size on success, or <= 0 on error/abstract type
+    if size <= 0:
+         return None
+    else:
+         return size
+# to here
 
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
