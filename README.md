@@ -31,7 +31,9 @@ Available functionality:
 - `declare_c_type(c_declaration)`: Create or update a local type from a C declaration.
 - `set_local_variable_type(function_address, variable_name, new_type)`: Set a local variable's type.
 
-- `read_memory(address, size)`: Get memory Dump
+- `dump_memory(address, size, terminator_pattern_hex, element_size, max_size, save_to_file, filename)`: Get memory dump (Appropriate for analysis with Python)
+- `get_data_info(address)` : Get data infomation
+- `get_struct_size(name)` : Get struct or union size
 
 ## Prerequisites
 
